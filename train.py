@@ -9,6 +9,7 @@ import codecs
 import numpy as np
 from chainer import cuda, Variable, FunctionSet, optimizers
 import chainer.functions as F
+from CharRNN import CharRNN, make_initial_state
 
 def load_data(args):
     vocab = {}
@@ -51,8 +52,11 @@ grad_clip = args.grad_clip
 train_data, words, vocab = load_data(args)
 pickle.dump(vocab, open('%s/vocab.bin'%args.data_dir, 'wb'))
 
-# have to change this line. if there is no args, we will use CharRnn 
-model = pickle.load(open(args.init_from, 'rb'))
+# have to change this line. if there is no args, we wil) use CharRnn 
+if len(args.init_from) > 0:
+    model = pickle.load(open(args.init_from, 'rb'))
+else:
+    model = CharRNN(len(vocab), n_units)
 
 if args.gpu >= 0:
     cuda.get_device(args.gpu).use()
@@ -60,4 +64,62 @@ if args.gpu >= 0:
 
 # Root Mean Square Propagation
 # we may replace it with SGD
-optimizer = optimizer.RMSprop(lr=args.learning_rate, alpha=args.decay_rate, eps=1e-8)
+optimizer = optimizers.RMSprop(lr=args.learning_rate, alpha=args.decay_rate, eps=1e-8)
+optimizer.setup(model)
+
+whole_len = train_data.shape[0]
+jump = whole_len / batchsize
+epoch = 0
+start_at = time.time()
+cur_at = start_at
+state = make_initial_state(n_units, batchsize=batchsize)
+
+if args.gpu >= 0:
+    accum_loss = Variable(cuda.zeros(()))
+    for key, value in state.items():
+        value.data = cuda.to_gpu(value.data)
+else:
+    accum_loss = Variable(np.zeros((), dtype=np.float32))
+
+print 'going to train {} iterations'.format(jump * n_epochs)
+
+for i in xrange(jump*n_epochs):
+    x_batch = np.array([train_data[(jump*j + i)% whole_len]
+                            for j in xrange(batchsize)])
+    y_batch = np.array([train_data[(jump * j + i + 1) % whole_len]
+                             for j in xrange(batchsize)])
+    if args.gpu >= 0:
+        x_batch = cuda.to_gpu(x_batch)
+        y_batch = cuda.to_gpu(y_batch)
+    state, loss_i = model.forward_one_step(x_batch, y_batch, state, dropout_ratio=args.dropout)
+    accum_loss += loss_i
+
+    if (i + 1) % bprop_len == 0:
+        now = time.time()
+        print '{}/{}, train_loss = {}, time = {:.2f}'.format((i+1)/bprop_len, jump, accum_loss.data / bprop_len, now-cur_at)
+        cur_at = now
+        optimizer.zero_grads()
+        accum_loss.backward()
+        accum_loss.unchain_backward()
+        if args.gpu >= 0:
+            accum_loss = Variable(cuda.zeros(()))
+        else:
+            accum_loss = Variable(np.zeros((), dtype=np.float32))
+
+        optimizer.clip_grads(grad_clip)
+        optimizer.update()
+
+        if (i + 1) % 10000 == 0:
+            fn = ('%s/charrnn_epoch_%.2f.chainermodel' % (args.checkpoint_dir, float(i)/jump))
+            pickle.dump(copy.deepcopy(model).to_cpu(), open(fn, 'wb'))
+            pickle.dump(copy.deepcopy(model).to_cpu(), open('%s/latest.chainermodel'%(args.checkpoint_dir), 'wb'))
+
+        if (i + 1) % jump == 0:
+            epoch += 1
+
+            if epoch >= args.learning_rate_decay_after:
+                optimizer.lr *= args.learning_rate_decay
+                print('decayed learning rate by a factor {} to {}'.format(args.learning_rate_decay, optimizer.lr))
+
+        sys.stdout.flush()
+
